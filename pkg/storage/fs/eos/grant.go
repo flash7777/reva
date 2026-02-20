@@ -48,6 +48,7 @@ func (fs *Eosfs) AddGrant(ctx context.Context, ref *provider.Reference, g *provi
 
 	eosACL, err := fs.getEosACL(ctx, g)
 	if err != nil {
+
 		return err
 	}
 
