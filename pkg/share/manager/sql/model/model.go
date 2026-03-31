@@ -1,4 +1,4 @@
-// Copyright 2018-2025 CERN
+// Copyright 2018-2026 CERN
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -147,7 +147,8 @@ type Share struct {
 	DeletedAt         gorm.DeletedAt `gorm:"uniqueIndex:u_share"`
 	Inode             string         `gorm:"size:32;uniqueIndex:u_share;index"`
 	Instance          string         `gorm:"size:32;uniqueIndex:u_share;index"`
-	ShareWith         string         `gorm:"size:255;uniqueIndex:u_share;index"` // 255 because this can be an external account, which has a long representation
+	SpaceId           string         `gorm:"size:64;index:idx_space_sharewith"`
+	ShareWith         string         `gorm:"size:255;uniqueIndex:u_share;index:idx_space_sharewith"` // 255 because this can be an external account, which has a long representation
 	SharedWithIsGroup bool
 	Description       string `gorm:"size:1024"`
 }
