@@ -20,6 +20,7 @@ import (
 	"github.com/cs3org/reva/v3/pkg/appctx"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	"github.com/cs3org/reva/v3/pkg/permissions"
+	"github.com/cs3org/reva/v3/pkg/sharehierarchy"
 	"github.com/cs3org/reva/v3/pkg/spaces"
 	"github.com/go-chi/chi/v5"
 	libregraph "github.com/owncloud/libre-graph-api-go"
@@ -184,7 +185,7 @@ func (s *svc) updateDrivePermissions(w http.ResponseWriter, r *http.Request) {
 
 	switch genericShare.shareType {
 	case ShareTypeShare, ShareTypeOCMShare:
-		s.updateSharePermissions(ctx, w, *genericShare, permission, resourceID)
+		s.updateSharePermissions(ctx, w, *genericShare, permission, resourceID, r.Header.Get("Force") == "true")
 	default:
 		s.updateLinkPermissions(ctx, w, genericShare.link, permission, resourceID)
 	}
@@ -302,7 +303,7 @@ func (s *svc) updateLinkPermissions(ctx context.Context, w http.ResponseWriter, 
 	_ = json.NewEncoder(w).Encode(lgPerm)
 }
 
-func (s *svc) updateSharePermissions(ctx context.Context, w http.ResponseWriter, genericShare GenericShare, lgPerm *libregraph.Permission, resourceId *provider.ResourceId) {
+func (s *svc) updateSharePermissions(ctx context.Context, w http.ResponseWriter, genericShare GenericShare, lgPerm *libregraph.Permission, resourceId *provider.ResourceId, force bool) {
 	log := appctx.GetLogger(ctx)
 
 	gw, err := s.getClient()
@@ -367,7 +368,17 @@ func (s *svc) updateSharePermissions(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 
+		var updateOpaque *typesv1beta1.Opaque
+		if force {
+			updateOpaque = &typesv1beta1.Opaque{
+				Map: map[string]*typesv1beta1.OpaqueEntry{
+					"force": {Decoder: "plain", Value: []byte("true")},
+				},
+			}
+		}
+
 		res, err := gw.UpdateShare(ctx, &collaborationv1beta1.UpdateShareRequest{
+			Opaque: updateOpaque,
 			Ref: &collaborationv1beta1.ShareReference{
 				Spec: &collaborationv1beta1.ShareReference_Id{
 					Id: genericShare.share.Id,
@@ -382,6 +393,14 @@ func (s *svc) updateSharePermissions(ctx context.Context, w http.ResponseWriter,
 		}
 
 		if res.Status.Code != rpcv1beta1.Code_CODE_OK {
+			if res.Status.Code == rpcv1beta1.Code_CODE_ABORTED {
+				if conflictErr := sharehierarchy.UnmarshalHierarchyConflictError(res.Status.Message); conflictErr != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusConflict)
+					json.NewEncoder(w).Encode(conflictErr)
+					return
+				}
+			}
 			log.Error().Interface("response", res).Msg("error updating public share")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
