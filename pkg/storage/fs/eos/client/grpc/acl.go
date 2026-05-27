@@ -190,12 +190,31 @@ func (c *Client) fixupACLs(ctx context.Context, auth eosclient.Authorization, in
 		}
 	}
 
-	// We need to inherit the ACLs for the parent directory as these are not available for files
+	// We need to inherit the ACLs for the parent directory as these are not available for files,
+	// and we need to merge attrs (including ACLs) that we persist on the version folder so they
+	// survive file overwrites.
 	if !info.IsDir {
 		parentInfo, err := c.GetFileInfoByPath(ctx, auth, path.Dir(info.File))
 		// Even if this call fails, at least return the current file object
-		if err == nil {
+		if err == nil && parentInfo.SysACL != nil {
 			info.SysACL.Entries = append(info.SysACL.Entries, parentInfo.SysACL.Entries...)
+		}
+
+		versionFolderInfo, err := c.GetFileInfoByPath(ctx, auth, eosclient.GetVersionFolder(info.File))
+		if err == nil {
+			if versionFolderInfo.SysACL != nil && info.SysACL != nil {
+				info.SysACL.Entries = append(info.SysACL.Entries, versionFolderInfo.SysACL.Entries...)
+			}
+			if info.Attrs == nil {
+				info.Attrs = map[string]string{}
+			}
+			for k, v := range versionFolderInfo.Attrs {
+				if k == "sys.acl" {
+					// sys.acl is already merged into SysACL above; don't shadow file-level value.
+					continue
+				}
+				info.Attrs[k] = v
+			}
 		}
 	}
 	return info

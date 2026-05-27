@@ -63,6 +63,13 @@ type EOSClient interface {
 	RollbackToVersion(ctx context.Context, auth Authorization, path, version string) error
 	ReadVersion(ctx context.Context, auth Authorization, p, version string) (io.ReadCloser, error)
 	GenerateToken(ctx context.Context, auth Authorization, path string, a *acl.Entry) (string, error)
+
+	// ApplyVersionFolderACL propagates the sys.acl xattr from the file's version folder
+	// onto the file itself. xattrs (including the system ACL) are persisted on the
+	// version folder so they survive file overwrites; this method "lazily" pushes the
+	// current value back to the file so EOS can enforce it on direct reads.
+	// No-op if path is not a file, has no version folder yet, or already matches.
+	ApplyVersionFolderACL(ctx context.Context, auth Authorization, path string) error
 }
 
 // AttrType is the type of extended attribute,

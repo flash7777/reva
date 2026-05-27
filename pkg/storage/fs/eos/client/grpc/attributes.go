@@ -26,6 +26,11 @@ func (c *Client) SetAttr(ctx context.Context, auth eosclient.Authorization, attr
 		return err
 	}
 
+	// We persist xattrs on the version folder so they survive file overwrites.
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	log.Debug().Bool("recursive", recursive).Str("path", path).Any("attr", attr).Str("trace", trace.Get(ctx)).Msg("eos-grpc SetAttr()")
 	// Favorites need to be stored per user so handle these separately
 	if attr.Type == eosclient.UserAttr && attr.Key == eosclient.FavoritesKey {
@@ -134,12 +139,17 @@ func (c *Client) unsetEOSAttr(ctx context.Context, auth eosclient.Authorization,
 	log := appctx.GetLogger(ctx)
 	log.Info().Str("func", "unsetEOSAttr").Str("uid,gid", auth.Role.UID+","+auth.Role.GID).Str("path", path).Msg("")
 
+	info, err := c.GetFileInfoByPath(ctx, auth, path)
+	if err != nil {
+		return err
+	}
+	// Mirror SetAttr: xattrs live on the version folder for files.
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	// Favorites need to be stored per user so handle these separately
 	if !deleteFavs && attr.Type == eosclient.UserAttr && attr.Key == eosclient.FavoritesKey {
-		info, err := c.GetFileInfoByPath(ctx, auth, path)
-		if err != nil {
-			return err
-		}
 		return c.handleFavAttr(ctx, auth, attr, recursive, path, info, false)
 	}
 
@@ -222,6 +232,37 @@ func (c *Client) GetAttrs(ctx context.Context, auth eosclient.Authorization, pat
 	}
 
 	return attrs, nil
+}
+
+// ApplyVersionFolderACL copies the sys.acl xattr from the file's version folder onto
+// the file itself, so EOS enforces the latest persisted ACL on direct reads. SetAttr
+// redirects file xattrs to the version folder, so this method calls setEOSAttr to
+// write directly on the file.
+func (c *Client) ApplyVersionFolderACL(ctx context.Context, auth eosclient.Authorization, p string) error {
+	if eosclient.IsVersionFolder(p) {
+		return nil
+	}
+	info, err := c.GetFileInfoByPath(ctx, auth, p)
+	if err != nil {
+		return err
+	}
+	if info.IsDir {
+		return nil
+	}
+	vfInfo, err := c.GetFileInfoByPath(ctx, auth, eosclient.GetVersionFolder(p))
+	if err != nil {
+		// No version folder yet — nothing to propagate.
+		return nil
+	}
+	aclVal := vfInfo.Attrs["sys.acl"]
+	if aclVal == "" || info.Attrs["sys.acl"] == aclVal {
+		return nil
+	}
+	return c.setEOSAttr(ctx, auth, &eosclient.Attribute{
+		Type: eosclient.SystemAttr,
+		Key:  "acl",
+		Val:  aclVal,
+	}, false, false, p, "")
 }
 
 func getAttribute(key, val string) (*eosclient.Attribute, error) {

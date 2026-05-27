@@ -440,11 +440,22 @@ func (c *Client) getRawFileInfoByPath(ctx context.Context, auth eosclient.Author
 
 func (c *Client) mergeACLsAndAttrsForFiles(ctx context.Context, auth eosclient.Authorization, info *eosclient.FileInfo) *eosclient.FileInfo {
 	// We need to inherit the ACLs for the parent directory as these are not available for files
+	// And the attributes from the version folders
 	if !info.IsDir {
 		parentInfo, err := c.getRawFileInfoByPath(ctx, auth, path.Dir(info.File))
 		// Even if this call fails, at least return the current file object
 		if err == nil {
 			info.SysACL.Entries = append(info.SysACL.Entries, parentInfo.SysACL.Entries...)
+		}
+
+		// We need to merge attrs set on the version folder, as xattrs are stored there
+		// to survive across file overwrites.
+		versionFolderInfo, err := c.getRawFileInfoByPath(ctx, auth, eosclient.GetVersionFolder(info.File))
+		if err == nil {
+			if versionFolderInfo.SysACL != nil {
+				info.SysACL.Entries = append(info.SysACL.Entries, versionFolderInfo.SysACL.Entries...)
+			}
+			maps.Copy(info.Attrs, versionFolderInfo.Attrs)
 		}
 	}
 
@@ -457,12 +468,17 @@ func (c *Client) SetAttr(ctx context.Context, auth eosclient.Authorization, attr
 		return errors.New("eos: attr is invalid: " + serializeAttribute(attr))
 	}
 
+	// We persist xattrs on the version folder so that they survive file overwrites.
+	info, err := c.getRawFileInfoByPath(ctx, auth, path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	// Favorites need to be stored per user so handle these separately
 	if attr.Type == eosclient.UserAttr && attr.Key == eosclient.FavoritesKey {
-		info, err := c.getRawFileInfoByPath(ctx, auth, path)
-		if err != nil {
-			return err
-		}
 		return c.handleFavAttr(ctx, auth, attr, recursive, path, info, true)
 	}
 	return c.setEOSAttr(ctx, auth, attr, errorIfExists, recursive, path, app)
@@ -540,13 +556,17 @@ func (c *Client) unsetEOSAttr(ctx context.Context, auth eosclient.Authorization,
 		return errors.New("eos: attr is invalid: " + serializeAttribute(attr))
 	}
 
-	var err error
+	// Mirror SetAttr: xattrs live on the version folder for files.
+	info, err := c.getRawFileInfoByPath(ctx, auth, path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	// Favorites need to be stored per user so handle these separately
 	if !deleteFavs && attr.Type == eosclient.UserAttr && attr.Key == eosclient.FavoritesKey {
-		info, err := c.getRawFileInfoByPath(ctx, auth, path)
-		if err != nil {
-			return err
-		}
 		return c.handleFavAttr(ctx, auth, attr, recursive, path, info, false)
 	}
 
@@ -573,6 +593,15 @@ func (c *Client) unsetEOSAttr(ctx context.Context, auth eosclient.Authorization,
 
 // GetAttr returns the attribute specified by key.
 func (c *Client) GetAttr(ctx context.Context, auth eosclient.Authorization, key, path string) (*eosclient.Attribute, error) {
+	// SetAttr writes xattrs of files to the version folder, so read from there.
+	info, err := c.getRawFileInfoByPath(ctx, auth, path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	args := []string{"attr", "get", key, path}
 	attrOut, _, err := c.executeEOS(ctx, args, auth)
 	if err != nil {
@@ -588,6 +617,14 @@ func (c *Client) GetAttr(ctx context.Context, auth eosclient.Authorization, key,
 
 // GetAttrs returns all the attributes of a resource.
 func (c *Client) GetAttrs(ctx context.Context, auth eosclient.Authorization, path string) ([]*eosclient.Attribute, error) {
+	info, err := c.getRawFileInfoByPath(ctx, auth, path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir {
+		path = eosclient.GetVersionFolder(path)
+	}
+
 	args := []string{"attr", "ls", path}
 	attrOut, _, err := c.executeEOS(ctx, args, auth)
 	if err != nil {
@@ -872,6 +909,37 @@ func (c *Client) ListVersions(ctx context.Context, auth eosclient.Authorization,
 		return []*eosclient.FileInfo{}, nil
 	}
 	return finfos, nil
+}
+
+// ApplyVersionFolderACL copies the sys.acl xattr from the file's version folder onto
+// the file itself, so EOS enforces the latest persisted ACL on direct reads. Since
+// SetAttr redirects file xattrs to the version folder, this method calls the raw EOS
+// attr setter to bypass that redirect.
+func (c *Client) ApplyVersionFolderACL(ctx context.Context, auth eosclient.Authorization, p string) error {
+	if eosclient.IsVersionFolder(p) {
+		return nil
+	}
+	info, err := c.getRawFileInfoByPath(ctx, auth, p)
+	if err != nil {
+		return err
+	}
+	if info.IsDir {
+		return nil
+	}
+	vfInfo, err := c.getRawFileInfoByPath(ctx, auth, eosclient.GetVersionFolder(p))
+	if err != nil {
+		// No version folder yet — nothing to propagate.
+		return nil
+	}
+	aclVal := vfInfo.Attrs["sys.acl"]
+	if aclVal == "" || info.Attrs["sys.acl"] == aclVal {
+		return nil
+	}
+	return c.setEOSAttr(ctx, auth, &eosclient.Attribute{
+		Type: eosclient.SystemAttr,
+		Key:  "acl",
+		Val:  aclVal,
+	}, false, false, p, "")
 }
 
 // RollbackToVersion rollbacks a file to a previous version.
