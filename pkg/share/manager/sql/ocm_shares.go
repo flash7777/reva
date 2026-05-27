@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	model "github.com/cs3org/reva/v3/pkg/share/manager/sql/model"
 	"github.com/cs3org/reva/v3/pkg/utils/cfg"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
 	"github.com/studio-b12/gowebdav"
 	"google.golang.org/genproto/protobuf/field_mask"
 	"google.golang.org/protobuf/proto"
@@ -54,7 +56,8 @@ type mgr struct {
 }
 
 type crate struct {
-	Graph []crateEntity `json:"@graph"`
+	Graph        []crateEntity        `json:"@graph"`
+	Distribution []zenodoDistribution `json:"distribution"`
 }
 
 type crateEntity struct {
@@ -65,6 +68,19 @@ type crateEntity struct {
 	ContentSize    string          `json:"contentSize"`
 	EncodingFormat string          `json:"encodingFormat"`
 	Description    string          `json:"description"`
+}
+
+type zenodoDistribution struct {
+	Type           string `json:"@type"`
+	ContentURL     string `json:"contentUrl"`
+	EncodingFormat string `json:"encodingFormat"`
+}
+
+type transferEntry struct {
+	srcURL         string
+	name           string
+	sizeHint       int64
+	encodingFormat string
 }
 
 type idRef struct {
@@ -394,52 +410,31 @@ func (m *mgr) ProcessEmbeddedShare(ctx context.Context, user *userpb.User, share
 			return nil, fmt.Errorf("unmarshal embedded payload: %w", err)
 		}
 
+		var entries []transferEntry
+		switch {
+		case len(c.Graph) > 0:
+			entries = entriesFromScienceMesh(log, c.Graph)
+		case len(c.Distribution) > 0:
+			entries = entriesFromZenodo(log, c.Distribution)
+		}
+
 		log.Debug().
 			Str("dest_path", destination).
-			Int("entities", len(c.Graph)).
+			Int("entries", len(entries)).
 			Msg("Processing embedded share payload")
 
-		for _, e := range c.Graph {
-			if !e.IsTransferable() {
-				continue
-			}
-
-			srcURL := e.URLString()
-			if srcURL == "" {
-				continue
-			}
-
-			name := strings.TrimSpace(e.Name)
-			if name == "" {
-				name = path.Base(srcURL)
-			}
-			if name == "" || name == "." || name == "/" {
-				log.Warn().
-					Str("entity_id", e.ID).
-					Str("src", srcURL).
-					Msg("Skipping entity with unusable destination name")
-				continue
-			}
-
-			remotePath := path.Join(destination, name)
-
-			size := int64(-1)
-			if e.ContentSize != "" {
-				if parsed, err := strconv.ParseInt(e.ContentSize, 10, 64); err == nil {
-					size = parsed
-				}
-			}
+		for _, e := range entries {
+			remotePath := path.Join(destination, e.name)
 
 			log.Debug().
-				Str("entity_id", e.ID).
-				Str("src", srcURL).
+				Str("src", e.srcURL).
 				Str("remote", remotePath).
-				Int64("size_hint", size).
-				Str("encoding_format", e.EncodingFormat).
+				Int64("size_hint", e.sizeHint).
+				Str("encoding_format", e.encodingFormat).
 				Msg("Streaming embedded file to WebDAV")
 
-			if err := uploadURLToWebDAV(ctx, httpClient, dav, srcURL, remotePath, size); err != nil {
-				return nil, fmt.Errorf("upload %s to %s: %w", srcURL, remotePath, err)
+			if err := uploadURLToWebDAV(ctx, httpClient, dav, e.srcURL, remotePath, e.sizeHint); err != nil {
+				return nil, fmt.Errorf("upload %s to %s: %w", e.srcURL, remotePath, err)
 			}
 		}
 
@@ -447,6 +442,79 @@ func (m *mgr) ProcessEmbeddedShare(ctx context.Context, user *userpb.User, share
 	}
 
 	return nil, errtypes.NotFound("protocol not found")
+}
+
+func entriesFromScienceMesh(log *zerolog.Logger, graph []crateEntity) []transferEntry {
+	entries := make([]transferEntry, 0, len(graph))
+	for _, e := range graph {
+		if !e.IsTransferable() {
+			continue
+		}
+		srcURL := e.URLString()
+		if srcURL == "" {
+			continue
+		}
+
+		name := strings.TrimSpace(e.Name)
+		if name == "" {
+			name = path.Base(srcURL)
+		}
+		if name == "" || name == "." || name == "/" {
+			log.Warn().
+				Str("entity_id", e.ID).
+				Str("src", srcURL).
+				Msg("Skipping entity with unusable destination name")
+			continue
+		}
+
+		size := int64(-1)
+		if e.ContentSize != "" {
+			if parsed, err := strconv.ParseInt(e.ContentSize, 10, 64); err == nil {
+				size = parsed
+			}
+		}
+
+		entries = append(entries, transferEntry{
+			srcURL:         srcURL,
+			name:           name,
+			sizeHint:       size,
+			encodingFormat: e.EncodingFormat,
+		})
+	}
+	return entries
+}
+
+func entriesFromZenodo(log *zerolog.Logger, dists []zenodoDistribution) []transferEntry {
+	entries := make([]transferEntry, 0, len(dists))
+	for _, d := range dists {
+		if d.Type != "DataDownload" || d.ContentURL == "" {
+			continue
+		}
+
+		name := zenodoFilename(d.ContentURL)
+		if name == "" || name == "." || name == "/" {
+			log.Warn().
+				Str("src", d.ContentURL).
+				Msg("Skipping Zenodo distribution with unusable destination name")
+			continue
+		}
+
+		entries = append(entries, transferEntry{
+			srcURL:         d.ContentURL,
+			name:           name,
+			sizeHint:       -1,
+			encodingFormat: d.EncodingFormat,
+		})
+	}
+	return entries
+}
+
+func zenodoFilename(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return path.Base(rawURL)
+	}
+	return path.Base(strings.TrimSuffix(u.Path, "/content"))
 }
 
 func (m *mgr) StoreReceivedShare(ctx context.Context, s *ocm.ReceivedShare) (*ocm.ReceivedShare, error) {
